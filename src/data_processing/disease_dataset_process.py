@@ -353,6 +353,11 @@ DATA_PATHS = {
 class DataProcessor:
     def __init__(self, type_disease):
         self.type_disease = type_disease
+        self.encoder = None
+        self.dropped_columns = None
+        self.age_median = None
+        self.health_region_median = None
+        self.days_to_notification_median = None
 
     def load_data(self):
         paths = DATA_PATHS[self.type_disease]
@@ -382,7 +387,8 @@ class DataProcessor:
 
         # Dias entre início dos sintomas e notificação (janela crítica da dengue: 3-6 dias)
         df['days_to_notification'] = (df['notification_date'] - df['symptom_onset_date']).dt.days
-        df['days_to_notification'] = df['days_to_notification'].fillna(df['days_to_notification'].median())
+        self.days_to_notification_median = df['days_to_notification'].median()
+        df['days_to_notification'] = df['days_to_notification'].fillna(self.days_to_notification_median)
         df['days_to_notification'] = df['days_to_notification'].clip(0, 90)
 
         # Derivando idade a partir da data de nascimento
@@ -404,8 +410,8 @@ class DataProcessor:
         df[bools] = df[bools].astype(int)
 
         # This keeps all indices non-negative, which is required by nn.Embedding.
-        oe = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-        df[CATEGORICAL_COLUMNS] = oe.fit_transform(df[CATEGORICAL_COLUMNS]) + 1
+        self.encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+        df[CATEGORICAL_COLUMNS] = self.encoder.fit_transform(df[CATEGORICAL_COLUMNS]) + 1
 
         # Fill with 0, which is the reserved "unknown" token from the shift above.
         df[CATEGORICAL_COLUMNS] = df[CATEGORICAL_COLUMNS].fillna(0).astype(int)
@@ -414,8 +420,10 @@ class DataProcessor:
         df[BINARY_COLUMNS] = df[BINARY_COLUMNS].replace({2: 0, 9: 0}).fillna(0).astype(int)
 
         # age: preencher NaN com mediana
-        df['age'] = df['age'].fillna(df['age'].median())
-        df['residence_health_region'] = df['residence_health_region'].fillna(df['residence_health_region'].median()).astype(int)
+        self.age_median = df['age'].median()
+        self.health_region_median = int(df['residence_health_region'].median())
+        df['age'] = df['age'].fillna(self.age_median)
+        df['residence_health_region'] = df['residence_health_region'].fillna(self.health_region_median).astype(int)
 
         df['symptom_count']     = df[SYMPTOM_COLS].sum(axis=1)
         df['comorbidity_count'] = df[COMORBIDITY_COLS].sum(axis=1)
@@ -439,6 +447,7 @@ class DataProcessor:
         # Não dropar colunas categóricas — variância delas é esperada ser concentrada após encoding
         cols_to_drop_low_variance = [c for c in cols_to_drop_low_variance if c not in CATEGORICAL_COLUMNS]
 
+        self.dropped_columns = cols_to_drop_low_variance
         df = df.drop(columns=cols_to_drop_low_variance)
 
         print(f'Colunas removidas (>{dominance_threshold*100:.0f}% mesmo valor): {len(cols_to_drop_low_variance)}')
@@ -465,3 +474,111 @@ class DataProcessor:
         df = self.process_target(df)
 
         return df, CATEGORICAL_COLUMNS, BINARY_COLUMNS
+
+    def process_patient(self, patient_dict):
+        """Process a single patient dict into a model-ready DataFrame row.
+
+        Expected keys in patient_dict:
+            - Symptoms/comorbidities/hemorrhagic (binary): 1=Yes, 0=No
+              fever, myalgia, headache, rash, vomiting, nausea, back_pain,
+              conjunctivitis, arthritis, joint_pain, petechiae, retro_orbital_pain,
+              diabetes, blood_disorder, liver_disease, kidney_disease,
+              hypertension, peptic_ulcer, autoimmune_disease,
+              nosebleed, gum_bleeding, metrorrhagia, petechiae_hemorrh,
+              hematuria, other_bleeding
+            - age: int (years)
+            - sex: 'Masculino', 'Feminino', or 'Ignorado'
+            - pregnancy_status: e.g. '1º Trimestre', 'Não', 'Não se aplica'
+            - race: e.g. 'Branca', 'Preta', 'Parda'
+            - education_level: e.g. 'Ensino médio completo'
+            - occupation_code: e.g. 'PROGRAMADOR DE INTERNET' or CBO int code
+            - residence_state: e.g. 'São Paulo' or IBGE int code
+            - symptom_onset_date: str 'YYYY-MM-DD'
+            - notification_date: str 'YYYY-MM-DD' (optional, defaults to today)
+            - residence_health_region: int (optional, defaults to training median)
+        """
+        from data_processing.sinan_mappings import (
+            SEX_MAP, PREGNANCY_MAP, RACE_MAP, EDUCATION_MAP,
+            CBO_MAP, UF_MAP,
+        )
+
+        if self.encoder is None:
+            raise RuntimeError("Must call load_data_process() before process_patient() to fit the encoder.")
+
+        p = patient_dict.copy()
+
+        # --- Resolve human-friendly labels to SINAN codes ---
+        if isinstance(p.get('sex'), str) and p['sex'] in SEX_MAP:
+            p['sex'] = SEX_MAP[p['sex']]
+        if isinstance(p.get('pregnancy_status'), str) and p['pregnancy_status'] in PREGNANCY_MAP:
+            p['pregnancy_status'] = PREGNANCY_MAP[p['pregnancy_status']]
+        if isinstance(p.get('race'), str) and p['race'] in RACE_MAP:
+            p['race'] = RACE_MAP[p['race']]
+        if isinstance(p.get('education_level'), str) and p['education_level'] in EDUCATION_MAP:
+            p['education_level'] = EDUCATION_MAP[p['education_level']]
+        if isinstance(p.get('occupation_code'), str):
+            p['occupation_code'] = CBO_MAP.get(p['occupation_code'].upper(), 0)
+        if isinstance(p.get('residence_state'), str) and p['residence_state'] in UF_MAP:
+            p['residence_state'] = UF_MAP[p['residence_state']]
+
+        # --- Date features ---
+        symptom_date = pd.to_datetime(p.get('symptom_onset_date'))
+        notif_date = pd.to_datetime(p.get('notification_date', pd.Timestamp.now().strftime('%Y-%m-%d')))
+
+        p['symptom_month'] = symptom_date.month
+        p['symptom_day'] = symptom_date.day
+        p['symptom_month_end'] = int(symptom_date.is_month_end)
+        p['symptom_year_end'] = int(symptom_date.is_year_end)
+        p['symptom_epi_week'] = symptom_date.isocalendar()[1]
+
+        days = (notif_date - symptom_date).days
+        p['days_to_notification'] = max(0, min(days, 90)) if pd.notnull(days) else self.days_to_notification_median
+
+        # Remove raw date fields
+        for k in ['symptom_onset_date', 'notification_date']:
+            p.pop(k, None)
+
+        # --- Defaults ---
+        p.setdefault('age', self.age_median)
+        p.setdefault('residence_health_region', self.health_region_median)
+
+        # Binary columns: default to 0
+        for col in BINARY_COLUMNS:
+            p.setdefault(col, 0)
+
+        # Build single-row DataFrame
+        row = pd.DataFrame([p])
+
+        # Booleans to int
+        bools = row.select_dtypes(include=['bool']).columns
+        row[bools] = row[bools].astype(int)
+
+        # Match dtype of each categorical column to what the encoder was trained on
+        for i, col in enumerate(CATEGORICAL_COLUMNS):
+            row[col] = row[col].astype(self.encoder.categories_[i].dtype)
+
+        # Encode categoricals with the fitted encoder (+1 shift for embedding)
+        row[CATEGORICAL_COLUMNS] = self.encoder.transform(row[CATEGORICAL_COLUMNS]) + 1
+        row[CATEGORICAL_COLUMNS] = row[CATEGORICAL_COLUMNS].fillna(0).astype(int)
+
+        # Binary encoding (in case user passes 2=No or 9=Unknown)
+        row[BINARY_COLUMNS] = row[BINARY_COLUMNS].replace({2: 0, 9: 0}).fillna(0).astype(int)
+
+        # Derived count features
+        row['symptom_count'] = row[SYMPTOM_COLS].sum(axis=1)
+        row['comorbidity_count'] = row[COMORBIDITY_COLS].sum(axis=1)
+        row['hemorrhagic_count'] = row[HEMORRHAGIC_COLS].sum(axis=1)
+
+        # Interaction features
+        interaction_cols = {
+            f'{a}_and_{b}': (row[a] * row[b]).astype(int)
+            for a, b in combinations(SYMPTOM_COLS, 2)
+        }
+        row = pd.concat([row, pd.DataFrame(interaction_cols, index=row.index)], axis=1)
+
+        # Drop low-variance columns (same ones dropped during training)
+        if self.dropped_columns:
+            cols_to_drop = [c for c in self.dropped_columns if c in row.columns]
+            row = row.drop(columns=cols_to_drop)
+
+        return row

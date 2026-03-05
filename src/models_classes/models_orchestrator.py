@@ -110,7 +110,7 @@ class ModelsOrchestrator:
 
     def combined_predict(self, mlp_model, lgbm_model, xgb_model, x_test_cat, x_test_num):
         dummy = torch.zeros(x_test_cat.shape[0], dtype=torch.long)
-        loader = DataLoader(TensorDataset(x_test_cat, x_test_num, dummy), batch_size=4096, shuffle=False)
+        loader = DataLoader(TensorDataset(x_test_cat, x_test_num, dummy), batch_size=8192, shuffle=False)
         mlp_probs  = mlp_model.predict_proba(loader).numpy()
         lgbm_probs = lgbm_model.predict_proba(x_test_cat, x_test_num, self.categorical_columns, self.numerical_columns)
         xgb_probs  = xgb_model.predict_proba(x_test_cat, x_test_num, self.categorical_columns, self.numerical_columns)
@@ -121,7 +121,7 @@ class ModelsOrchestrator:
             thresholds = [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]
 
         dummy = torch.zeros(x_test_cat.shape[0], dtype=torch.long)
-        loader = DataLoader(TensorDataset(x_test_cat, x_test_num, dummy), batch_size=4096, shuffle=False)
+        loader = DataLoader(TensorDataset(x_test_cat, x_test_num, dummy), batch_size=8192, shuffle=False)
         mlp_probs  = mlp_model.predict_proba(loader).numpy()
         lgbm_probs = lgbm_model.predict_proba(x_test_cat, x_test_num, self.categorical_columns, self.numerical_columns)
         xgb_probs  = xgb_model.predict_proba(x_test_cat, x_test_num, self.categorical_columns, self.numerical_columns)
@@ -148,6 +148,8 @@ class ModelsOrchestrator:
         lgbm_TPweight = float(((lgbm_preds == 1) & (y_true == 1)).sum() / (y_true == 1).sum())
         xgb_TPweight  = float(((xgb_preds  == 1) & (y_true == 1)).sum() / (y_true == 1).sum())
 
+        self.tp_weights = {'mlp': mlp_TPweight, 'lgbm': lgbm_TPweight, 'xgb': xgb_TPweight}
+
         print(f"MLP TP: {mlp_TPweight:.2%}")
         print(f"LGBM TP: {lgbm_TPweight:.2%}")
         print(f"XGB TP: {xgb_TPweight:.2%}")
@@ -167,3 +169,58 @@ class ModelsOrchestrator:
             'weighted_positive':   weighted_confidence > threshold,
         })
         return confirmation_df
+
+    def predict(self, patient_dict, mlp_model, lgbm_model, xgb_model, threshold=0.4):
+        """Predict disease classification for a single patient from raw data.
+
+        Args:
+            patient_dict: dict with patient data (human-friendly labels accepted).
+                See DataProcessor.process_patient() for expected keys.
+            mlp_model: trained ArbovirosesMLP model
+            lgbm_model: trained GradientBoostingDiseaseClassifier (lgbm)
+            xgb_model: trained GradientBoostingDiseaseClassifier (xgb)
+            threshold: classification threshold (default 0.4)
+
+        Returns:
+            dict with individual and combined predictions, probabilities, and confidence.
+        """
+        row = self.data_processor.process_patient(patient_dict)
+
+        cat_cols = list(self.categorical_columns)
+        num_cols = [c for c in self.numerical_columns if c in row.columns]
+
+        x_cat = torch.tensor(row[cat_cols].values, dtype=torch.long).to(device)
+        x_num = torch.tensor(row[num_cols].values, dtype=torch.float32).to(device)
+
+        # MLP prediction
+        dummy = torch.zeros(x_cat.shape[0], dtype=torch.long).to(device)
+        loader = DataLoader(TensorDataset(x_cat, x_num, dummy), batch_size=1, shuffle=False)
+        mlp_prob = float(mlp_model.predict_proba(loader).numpy()[0])
+
+        # LGBM & XGB predictions
+        lgbm_prob = float(lgbm_model.predict_proba(x_cat, x_num, cat_cols, num_cols)[0])
+        xgb_prob = float(xgb_model.predict_proba(x_cat, x_num, cat_cols, num_cols)[0])
+
+        # Simple average
+        avg_prob = (mlp_prob + lgbm_prob + xgb_prob) / 3
+
+        # Weighted confidence using TP weights (if available from evaluate_combined)
+        tp = getattr(self, 'tp_weights', None)
+        if tp:
+            total = tp['mlp'] + tp['lgbm'] + tp['xgb']
+            weighted_prob = (mlp_prob * tp['mlp'] + lgbm_prob * tp['lgbm'] + xgb_prob * tp['xgb']) / total
+        else:
+            weighted_prob = avg_prob
+
+        return {
+            'mlp_probability': mlp_prob,
+            'lgbm_probability': lgbm_prob,
+            'xgb_probability': xgb_prob,
+            'mlp_prediction': int(mlp_prob > threshold),
+            'lgbm_prediction': int(lgbm_prob > threshold),
+            'xgb_prediction': int(xgb_prob > threshold),
+            'average_probability': avg_prob,
+            'weighted_probability': weighted_prob,
+            'final_prediction': int(weighted_prob > threshold),
+            'unanimous': all(p > threshold for p in [mlp_prob, lgbm_prob, xgb_prob]),
+        }

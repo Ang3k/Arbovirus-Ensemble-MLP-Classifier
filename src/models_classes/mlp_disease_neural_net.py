@@ -65,7 +65,7 @@ class ArbovirosesMLP(nn.Module):
         with torch.no_grad():
             for x_cat, x_num, _ in test_loader:
                 out = self(x_cat, x_num)
-                all_probs.append(torch.sigmoid(out).squeeze().cpu())
+                all_probs.append(torch.sigmoid(out).squeeze(-1).cpu())
         return torch.cat(all_probs)
 
     def evaluate(self, test_loader, y_test, thresholds=None):

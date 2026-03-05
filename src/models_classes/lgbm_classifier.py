@@ -38,7 +38,7 @@ class GradientBoostingDiseaseClassifier:
         else:
             self.model = None  # set after Optuna optimization in fit()
 
-    def _optimize(self, X, y, n_trials=50):
+    def _optimize(self, X, y, n_trials=100):
         model_type = self._model_type
         device = self._device
 
@@ -69,7 +69,7 @@ class GradientBoostingDiseaseClassifier:
                 }
                 model = XGBClassifier(device=device, **params)
 
-            return cross_val_score(model, X, y, cv=3, scoring='recall').mean()
+            return cross_val_score(model, X, y, cv=2, scoring='recall').mean()
 
         study = optuna.create_study(direction='maximize')
         study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
@@ -88,7 +88,7 @@ class GradientBoostingDiseaseClassifier:
             pd.DataFrame(x_num.cpu().numpy(), columns=numerical_columns),
         ], axis=1)
 
-    def fit(self, x_train_cat, x_train_num, y_train, categorical_columns, numerical_columns, n_trials=50):
+    def fit(self, x_train_cat, x_train_num, y_train, categorical_columns, numerical_columns, n_trials=100):
         self.feature_names = categorical_columns + list(numerical_columns)
         X_train = self._prepare_data(x_train_cat, x_train_num, categorical_columns, numerical_columns)
         y = y_train.cpu().numpy()
