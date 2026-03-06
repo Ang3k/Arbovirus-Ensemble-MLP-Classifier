@@ -1,4 +1,6 @@
 import sys
+import json
+import joblib
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -224,3 +226,88 @@ class ModelsOrchestrator:
             'final_prediction': int(weighted_prob > threshold),
             'unanimous': all(p > threshold for p in [mlp_prob, lgbm_prob, xgb_prob]),
         }
+
+    def save_artifacts(self, directory, mlp_model, lgbm_model, xgb_model, embedding_sizes):
+        """Save all models and preprocessing artifacts for inference without training data."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+
+        # Save PyTorch MLP
+        torch.save(mlp_model.state_dict(), directory / 'mlp.pth')
+
+        # Save LGBM and XGB models
+        joblib.dump(lgbm_model.model, directory / 'lgbm_model.joblib')
+        joblib.dump(xgb_model.model, directory / 'xgb_model.joblib')
+
+        # Save fitted encoder
+        joblib.dump(self.data_processor.encoder, directory / 'encoder.joblib')
+
+        # Save metadata as JSON
+        artifacts = {
+            'categorical_columns': list(self.categorical_columns),
+            'numerical_columns': list(self.numerical_columns),
+            'dropped_columns': self.data_processor.dropped_columns or [],
+            'embedding_sizes': [[int(a), int(b)] for a, b in embedding_sizes],
+            'age_median': float(self.data_processor.age_median),
+            'health_region_median': int(self.data_processor.health_region_median),
+            'days_to_notification_median': float(self.data_processor.days_to_notification_median),
+            'tp_weights': getattr(self, 'tp_weights', None),
+            'type_disease': self.data_processor.type_disease,
+        }
+        with open(directory / 'artifacts.json', 'w') as f:
+            json.dump(artifacts, f, indent=2)
+
+        print(f'Artifacts saved to {directory}')
+
+    @staticmethod
+    def load_for_inference(directory):
+        """Load models and artifacts from disk for inference (no training data needed)."""
+        directory = Path(directory)
+
+        with open(directory / 'artifacts.json') as f:
+            artifacts = json.load(f)
+
+        # Build a lightweight orchestrator without loading training CSVs
+        orch = object.__new__(ModelsOrchestrator)
+        orch.categorical_columns = artifacts['categorical_columns']
+        orch.numerical_columns = artifacts['numerical_columns']
+        orch.tp_weights = artifacts['tp_weights']
+        orch.train_loader = None
+        orch.test_loader = None
+        orch.y_train = None
+        orch.y_test = None
+
+        # Restore DataProcessor with saved artifacts (no CSV loading)
+        dp = object.__new__(DataProcessor)
+        dp.type_disease = artifacts['type_disease']
+        dp.encoder = joblib.load(directory / 'encoder.joblib')
+        dp.dropped_columns = artifacts['dropped_columns']
+        dp.age_median = artifacts['age_median']
+        dp.health_region_median = artifacts['health_region_median']
+        dp.days_to_notification_median = artifacts['days_to_notification_median']
+        orch.data_processor = dp
+
+        # Load MLP
+        embedding_sizes = [tuple(e) for e in artifacts['embedding_sizes']]
+        mlp_model = ArbovirosesMLP(
+            numericals_shape=len(artifacts['numerical_columns']),
+            embedding_sizes=embedding_sizes,
+            hidden_layers=[1024, 512, 256, 128],
+            probability_dropout=[0.1, 0.2],
+        ).to(device)
+        mlp_model.load_state_dict(torch.load(directory / 'mlp.pth', weights_only=True, map_location=device))
+        mlp_model.eval()
+
+        # Load LGBM
+        lgbm_model = object.__new__(GradientBoostingDiseaseClassifier)
+        lgbm_model.model = joblib.load(directory / 'lgbm_model.joblib')
+        lgbm_model.feature_names = artifacts['categorical_columns'] + list(artifacts['numerical_columns'])
+        lgbm_model._model_type = 'lgbm'
+
+        # Load XGB
+        xgb_model = object.__new__(GradientBoostingDiseaseClassifier)
+        xgb_model.model = joblib.load(directory / 'xgb_model.joblib')
+        xgb_model.feature_names = artifacts['categorical_columns'] + list(artifacts['numerical_columns'])
+        xgb_model._model_type = 'xgb'
+
+        return orch, mlp_model, lgbm_model, xgb_model
